@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python C:\\Users\\steve\\AppData\\Local\\Programs\\Python\\Python311\\Claude\\*:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.command' | grep -q 'keap_call_manager' && git -C 'C:/Users/steve/AppData/Local/Programs/Python/Python311/Claude' pull 2>/dev/null || true",
+            "statusMessage": "Pulling latest call_log from GitHub..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.command' | grep -q 'keap_call_manager' && cd 'C:/Users/steve/AppData/Local/Programs/Python/Python311/Claude' && git add call_log.json queue_state.json && git diff --cached --quiet || git commit -m \"Update call log\" && git push 2>/dev/null || true",
+            "statusMessage": "Saving call_log to GitHub..."
+          }
+        ]
+      }
+    ]
+  }
+}
