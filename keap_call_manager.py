@@ -117,12 +117,23 @@ def _parse_keap_date(date_str: str):
 # ============================================================================
 # KEAP NOTES
 # ============================================================================
+def _is_call_note(n: dict) -> bool:
+    """Return True if this note looks like a call note."""
+    ntype = (n.get("type") or "").strip().lower()
+    title = (n.get("title") or "").strip().lower()
+    if ntype == "call":
+        return True
+    if title.startswith("call") or title.startswith("called"):
+        return True
+    return False
+
+
 def get_contact_call_notes(contact_id: int, limit: int = 5) -> list:
     """Get Call-type notes for a contact from Keap, newest first."""
     try:
-        data = keap_get(f"/contacts/{contact_id}/notes", params={"limit": 50})
+        data = keap_get("/notes", params={"contact_id": contact_id, "limit": 200})
         notes = data if isinstance(data, list) else data.get("notes", [])
-        call_notes = [n for n in notes if n.get("type") == "Call"]
+        call_notes = [n for n in notes if _is_call_note(n)]
         call_notes.sort(
             key=lambda n: n.get("last_updated") or n.get("date_created") or "",
             reverse=True
@@ -155,7 +166,7 @@ def get_all_call_notes_since(since_dt: datetime) -> list:
             notes = data if isinstance(data, list) else data.get("notes", [])
             if not notes:
                 break
-            all_notes.extend([n for n in notes if n.get("type") == "Call"])
+            all_notes.extend([n for n in notes if _is_call_note(n)])
             if len(notes) < 1000:
                 break
             offset += 1000
