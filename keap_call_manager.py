@@ -2,10 +2,10 @@
 """
 Keap Call Manager
 - Suggests contacts to call (prioritized by opportunity value & days since last call)
-- Prompts for notes, stores them in Keap, logs the call locally
-- Provides a weekly scorecard of calls made
+- Prompts for notes, stores them in Keap
+- Scorecard and prior notes pulled live from Keap
 
-Usage: python "Keap CRM/keap_call_manager.py"
+Usage: python keap_call_manager.py  (or double-click run_call_manager.bat)
 """
 
 import sys
@@ -20,9 +20,7 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-sys.path.append(r"C:\Users\steve\Documents\python\Keap CRM")
-sys.path.append(r"C:\Users\steve\Documents\python")
-sys.path.append(r"C:\Users\steve\Downloads")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import keap_refresh_token as krt
 import requests
@@ -30,23 +28,21 @@ import requests
 # ============================================================================
 # CONFIG
 # ============================================================================
-KEAP_API_BASE   = "https://api.infusionsoft.com/crm/rest/v1"
-TOKENS_JSON     = r"O:\keap_tokens\tokens.json"
-CALL_LOG_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "call_log.json")
-QUEUE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_state.json")
+KEAP_API_BASE = "https://api.infusionsoft.com/crm/rest/v1"
+TOKENS_JSON   = r"O:\keap_tokens\tokens.json"
+
+# In-memory session tracking — contacts shown this session move to end of queue
+_shown_this_session = set()
 
 # ============================================================================
-# TOKEN HELPERS (same pattern as keap_agent.py)
+# TOKEN HELPERS
 # ============================================================================
 def _token_expired(tokens: dict) -> bool:
-    """Support both created_at/expires_in and fetched_at/expires_at token formats."""
     try:
-        # Prefer expires_at if present (from keap_refresh_token standalone)
         expires_at = tokens.get("expires_at")
         if expires_at is not None:
             return time.time() >= (int(expires_at) - 120)
-        # Fallback: created_at + expires_in
-        created = int(tokens.get("created_at", 0))
+        created    = int(tokens.get("created_at", 0))
         expires_in = int(tokens.get("expires_in", 0))
         return (time.time() - created) >= (expires_in - 120)
     except (TypeError, ValueError):
@@ -73,7 +69,6 @@ def keap_get(path: str, params=None) -> dict:
     url = f"{KEAP_API_BASE}{path}"
     r = requests.get(url, headers=_headers(), params=params or {}, timeout=60)
     if r.status_code == 401:
-        # Force refresh once
         tokens = krt.load_tokens(TOKENS_JSON)
         refreshed = krt.keap_refresh(tokens["refresh_token"], krt.CLIENT_ID, krt.CLIENT_SECRET)
         now = int(time.time())
@@ -90,7 +85,6 @@ def keap_post(path: str, data: dict) -> dict:
     url = f"{KEAP_API_BASE}{path}"
     r = requests.post(url, headers=_headers(), json=data, timeout=60)
     if r.status_code == 401:
-        # Force refresh and retry (same as keap_get)
         tokens = krt.load_tokens(TOKENS_JSON)
         refreshed = krt.keap_refresh(tokens["refresh_token"], krt.CLIENT_ID, krt.CLIENT_SECRET)
         now = int(time.time())
@@ -104,153 +98,116 @@ def keap_post(path: str, data: dict) -> dict:
 
 
 # ============================================================================
-# LOCAL CALL LOG
+# DATE HELPER
 # ============================================================================
-def load_call_log() -> list:
-    if not os.path.exists(CALL_LOG_FILE):
-        return []
+def _parse_keap_date(date_str: str):
+    """Parse a Keap ISO date string to a naive local datetime."""
+    if not date_str:
+        return None
     try:
-        with open(CALL_LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        ds = date_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ds)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+# ============================================================================
+# KEAP NOTES
+# ============================================================================
+def get_contact_call_notes(contact_id: int, limit: int = 5) -> list:
+    """Get Call-type notes for a contact from Keap, newest first."""
+    try:
+        data = keap_get(f"/contacts/{contact_id}/notes", params={"limit": 50})
+        notes = data if isinstance(data, list) else data.get("notes", [])
+        call_notes = [n for n in notes if n.get("type") == "Call"]
+        call_notes.sort(
+            key=lambda n: n.get("last_updated") or n.get("date_created") or "",
+            reverse=True
+        )
+        return call_notes[:limit]
     except Exception:
         return []
 
 
-def save_call_log(log: list):
-    log_dir = os.path.dirname(CALL_LOG_FILE)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-    with open(CALL_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(log, f, indent=2)
-
-
-def log_call(contact_id: int, contact_name: str, opp_title: str, notes: str):
-    log = load_call_log()
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "contact_id": contact_id,
-        "contact_name": contact_name,
-        "opportunity": opp_title,
-        "notes": notes,
-    }
-    log.append(entry)
-    save_call_log(log)
-    return entry
-
-
-def last_call_date(contact_id: int, log: list):
-    """Return datetime of most recent call for this contact, or None."""
-    if contact_id is None:
-        return None
-    try:
-        cid = int(contact_id)
-    except (TypeError, ValueError):
-        return None
-    calls = [e for e in log if e.get("contact_id") is not None and int(e["contact_id"]) == cid]
-    if not calls:
-        return None
-    latest = max(calls, key=lambda e: e["timestamp"])
-    return datetime.fromisoformat(latest["timestamp"])
-
-
-def days_since_last_call(contact_id: int, log: list) -> float:
-    """Days since last call; 9999 if never called."""
-    dt = last_call_date(contact_id, log)
+def days_since_last_call(contact_id: int) -> float:
+    """Days since last Call note in Keap; 9999 if never called."""
+    notes = get_contact_call_notes(contact_id, limit=1)
+    if not notes:
+        return 9999
+    date_str = notes[0].get("last_updated") or notes[0].get("date_created", "")
+    dt = _parse_keap_date(date_str)
     if dt is None:
         return 9999
     return (datetime.now() - dt).total_seconds() / 86400
 
 
-def prior_notes_for_contact(contact_id: int, log: list, limit: int = 2) -> list:
-    """Return most recent local call-log notes for this contact."""
-    if contact_id is None:
-        return []
+def get_all_call_notes_since(since_dt: datetime) -> list:
+    """Fetch all Call-type notes from Keap since a given date."""
+    since_str = since_dt.strftime("%Y-%m-%dT00:00:00Z")
     try:
-        cid = int(contact_id)
-    except (TypeError, ValueError):
-        return []
-
-    calls = []
-    for entry in log:
-        try:
-            if entry.get("contact_id") is None or int(entry.get("contact_id")) != cid:
-                continue
-        except (TypeError, ValueError):
-            continue
-        calls.append(entry)
-
-    calls.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
-    return calls[:max(0, int(limit))]
-
-
-# ============================================================================
-# QUEUE STATE (track who we've shown so "new" people appear first tomorrow)
-# ============================================================================
-def load_queue_state() -> dict:
-    """Returns {contact_id: last_shown_iso_timestamp}"""
-    if not os.path.exists(QUEUE_STATE_FILE):
-        return {}
-    try:
-        with open(QUEUE_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("shown", {}) if isinstance(data, dict) else {}
+        all_notes = []
+        offset = 0
+        while True:
+            data  = keap_get("/notes", params={"since": since_str, "limit": 1000, "offset": offset})
+            notes = data if isinstance(data, list) else data.get("notes", [])
+            if not notes:
+                break
+            all_notes.extend([n for n in notes if n.get("type") == "Call"])
+            if len(notes) < 1000:
+                break
+            offset += 1000
+        return all_notes
     except Exception:
-        return {}
+        return []
 
 
-def save_queue_state(shown: dict):
-    log_dir = os.path.dirname(QUEUE_STATE_FILE)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-    with open(QUEUE_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"shown": shown, "updated": datetime.now().isoformat()}, f, indent=2)
+def store_call_note_in_keap(contact_id: int, contact_name: str, notes: str):
+    """Store call notes as a Keap Call note on the contact."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    note_data = {
+        "contact_id": contact_id,
+        "title":      f"Call - {contact_name} - {ts}",
+        "body":       notes,
+        "type":       "Call",
+    }
+    try:
+        return keap_post("/notes", note_data)
+    except Exception as e:
+        print(f"  [warn] Could not save note to Keap: {e}")
+        return None
 
 
+# ============================================================================
+# SESSION TRACKING (in-memory only)
+# ============================================================================
 def record_shown(contact_id: int):
-    """Record that we showed this contact today (so they go to end of queue tomorrow)."""
-    state = load_queue_state()
-    state[str(contact_id)] = datetime.now().isoformat()
-    save_queue_state(state)
+    _shown_this_session.add(contact_id)
 
 
-def was_shown_today(contact_id: int, state: dict) -> bool:
-    """True if we displayed this contact earlier today."""
-    ts = state.get(str(contact_id))
-    if not ts:
-        return False
-    try:
-        return datetime.fromisoformat(ts).date() == datetime.now().date()
-    except Exception:
-        return False
+def was_shown_this_session(contact_id: int) -> bool:
+    return contact_id in _shown_this_session
 
 
 # ============================================================================
 # KEAP DATA FETCH
 # ============================================================================
 def get_active_opportunities(limit: int = 200) -> list:
-    """Fetch all active (non-won/lost/closed) opportunities."""
+    """Fetch all active (non-won/lost) opportunities."""
     all_opps = []
     page = 0
     while len(all_opps) < limit:
-        data = keap_get("/opportunities", params={"page": page, "page_size": 200})
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = data.get("opportunities", [])
-        else:
-            items = []
+        data  = keap_get("/opportunities", params={"page": page, "page_size": 200})
+        items = data if isinstance(data, list) else data.get("opportunities", [])
         if not items:
             break
         for opp in items:
-            stage = opp.get("stage") or {}
-            stage_name = ""
-            if isinstance(stage, dict):
-                stage_name = str(stage.get("name") or "").strip().upper()
-
-            # Ignore opportunities based only on stage name.
+            stage      = opp.get("stage") or {}
+            stage_name = str(stage.get("name") or "").strip().upper() if isinstance(stage, dict) else ""
             if "WON" in stage_name or "LOST" in stage_name:
                 continue
-
             all_opps.append(opp)
         if len(items) < 200:
             break
@@ -266,46 +223,34 @@ def get_contact_detail(contact_id: int) -> dict:
 
 
 # ============================================================================
-# CONTACT SCORING / SUGGESTION
+# SCORING / QUEUE BUILDING
 # ============================================================================
-def score_opportunity(opp: dict, log: list) -> float:
-    """
-    Higher score = should call sooner.
-    Factors:
-      - Days since last call (more days = higher priority)
-      - Opportunity value (higher = higher priority)
-    """
-    contact = opp.get("contact", {})
+def score_opportunity(opp: dict) -> float:
+    contact    = opp.get("contact", {})
     contact_id = contact.get("id") if isinstance(contact, dict) else None
-    days = days_since_last_call(contact_id, log) if contact_id else 9999
+    days       = days_since_last_call(contact_id) if contact_id else 9999
 
     value = 0
     try:
         value = float(opp.get("projected_revenue_high") or opp.get("value") or 0)
     except (TypeError, ValueError):
-        value = 0
+        pass
 
-    # Normalize: cap days at 90 for scoring, value capped at $100k
-    days_score  = min(days, 90) / 90        # 0.0 – 1.0
-    value_score = min(value, 100000) / 100000  # 0.0 – 1.0
-
+    days_score  = min(days, 90) / 90
+    value_score = min(value, 100000) / 100000
     return days_score * 0.6 + value_score * 0.4
 
 
-def build_call_queue(log: list) -> list:
-    """
-    Returns a list of dicts ready for presentation, sorted by priority (highest first).
-    Deduplicates by contact — keeps only the top opp per contact.
-    """
-    opps = get_active_opportunities()
+def build_call_queue() -> list:
+    opps          = get_active_opportunities()
     seen_contacts = {}
 
     for opp in opps:
         contact = opp.get("contact", {})
-        cid = contact.get("id") if isinstance(contact, dict) else None
+        cid     = contact.get("id") if isinstance(contact, dict) else None
         if cid is None:
             continue
-        score = score_opportunity(opp, log)
+        score = score_opportunity(opp)
         if cid not in seen_contacts or score > seen_contacts[cid]["score"]:
             seen_contacts[cid] = {"opp": opp, "score": score}
 
@@ -313,18 +258,16 @@ def build_call_queue(log: list) -> list:
 
     queue = []
     for item in ranked:
-        opp = item["opp"]
+        opp          = item["opp"]
         contact_stub = opp.get("contact", {})
-        cid = contact_stub.get("id")
-
-        # Pull full contact detail
-        contact = get_contact_detail(cid) if cid else {}
+        cid          = contact_stub.get("id")
+        contact      = get_contact_detail(cid) if cid else {}
 
         first = contact.get("given_name") or contact_stub.get("first_name", "")
         last  = contact.get("family_name") or contact_stub.get("last_name", "")
         name  = f"{first} {last}".strip() or f"Contact #{cid}"
 
-        phones = contact.get("phone_numbers") or []
+        phones     = contact.get("phone_numbers") or []
         phone_list = []
         for p in phones:
             if not isinstance(p, dict) or not p.get("number"):
@@ -336,7 +279,7 @@ def build_call_queue(log: list) -> list:
         emails = contact.get("email_addresses", [])
         email  = next((e["email"] for e in emails if isinstance(e, dict) and e.get("email")), "No email")
 
-        company = contact.get("company") or {}
+        company      = contact.get("company") or {}
         company_name = company.get("company_name", "") if isinstance(company, dict) else ""
 
         value = 0
@@ -345,50 +288,29 @@ def build_call_queue(log: list) -> list:
         except (TypeError, ValueError):
             pass
 
-        stage = opp.get("stage") or {}
+        stage      = opp.get("stage") or {}
         stage_name = stage.get("name", "Unknown") if isinstance(stage, dict) else "Unknown"
 
-        days = days_since_last_call(cid, log)
+        days     = days_since_last_call(cid)
         days_str = f"{int(days)}d ago" if days < 9999 else "never"
 
         queue.append({
-            "contact_id":   cid,
-            "name":         name,
-            "company":      company_name,
-            "phone":        phone,
-            "email":        email,
-            "opp_title":    opp.get("opportunity_title") or opp.get("title") or "Opportunity",
-            "opp_value":    value,
-            "stage":        stage_name,
-            "last_call":    days_str,
-            "score":        item["score"],
+            "contact_id":  cid,
+            "name":        name,
+            "company":     company_name,
+            "phone":       phone,
+            "email":       email,
+            "opp_title":   opp.get("opportunity_title") or opp.get("title") or "Opportunity",
+            "opp_value":   value,
+            "stage":       stage_name,
+            "last_call":   days_str,
+            "score":       item["score"],
         })
 
-    # Move contacts we've already shown today to the end, so "new" people appear first
-    shown_state = load_queue_state()
-    new_today = [q for q in queue if not was_shown_today(q["contact_id"], shown_state)]
-    shown_today = [q for q in queue if was_shown_today(q["contact_id"], shown_state)]
-    return new_today + shown_today
-
-
-# ============================================================================
-# KEAP NOTE / CALL LOGGING
-# ============================================================================
-def store_call_note_in_keap(contact_id: int, notes: str):
-    """Store call notes as a Keap note on the contact."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    note_data = {
-        "contact_id": contact_id,
-        "title": f"Call Note - {ts}",
-        "body": notes,
-        "type": "Call",
-    }
-    try:
-        result = keap_post("/notes", note_data)
-        return result
-    except Exception as e:
-        print(f"  [warn] Could not save note to Keap: {e}")
-        return None
+    # Contacts already shown this session go to the end
+    new   = [q for q in queue if not was_shown_this_session(q["contact_id"])]
+    shown = [q for q in queue if was_shown_this_session(q["contact_id"])]
+    return new + shown
 
 
 # ============================================================================
@@ -402,105 +324,86 @@ def print_contact_card(item: dict, rank: int):
     print_separator()
     print(f"  #{rank}  SUGGESTED CALL")
     print_separator()
-    print(f"  Name    : {item['name']}")
+    print(f"  Name     : {item['name']}")
     if item["company"]:
-        print(f"  Company : {item['company']}")
+        print(f"  Company  : {item['company']}")
     for i, ph in enumerate(item["phone"]):
-        label = "Phone   :" if i == 0 else "         "
+        label = "Phone    :" if i == 0 else "          "
         print(f"  {label} {ph}")
-    print(f"  Email   : {item['email']}")
-    print(f"  Opp     : {item['opp_title']}")
-    print(f"  Stage   : {item['stage']}")
+    print(f"  Email    : {item['email']}")
+    print(f"  Opp      : {item['opp_title']}")
+    print(f"  Stage    : {item['stage']}")
     if item["opp_value"]:
-        print(f"  Value   : ${item['opp_value']:,.0f}")
+        print(f"  Value    : ${item['opp_value']:,.0f}")
     print(f"  Last call: {item['last_call']}")
     print_separator("-", 60)
 
 
-def print_prior_notes(item: dict, log: list, limit: int = 2):
-    """Show the previous local notes for this contact before logging a new call."""
-    prior = prior_notes_for_contact(item.get("contact_id"), log, limit=limit)
+def print_prior_notes(item: dict):
+    """Show the 2 most recent Call notes from Keap for this contact."""
+    notes = get_contact_call_notes(item["contact_id"], limit=2)
     print("  Prior notes:")
-    if not prior:
+    if not notes:
         print("    (none yet)")
         print_separator("-", 60)
         return
-
-    for i, entry in enumerate(prior, start=1):
-        ts = entry.get("timestamp", "")
-        when = ts
-        try:
-            when = datetime.fromisoformat(ts).strftime("%Y-%m-%d %I:%M %p")
-        except Exception:
-            pass
-        note_text = (entry.get("notes") or "").strip() or "(no notes)"
-        preview = note_text[:140].replace("\n", " ")
-        if len(note_text) > 140:
+    for i, note in enumerate(notes, start=1):
+        date_str = note.get("last_updated") or note.get("date_created", "")
+        dt       = _parse_keap_date(date_str)
+        when     = dt.strftime("%Y-%m-%d %I:%M %p") if dt else date_str
+        body     = (note.get("body") or "").strip() or "(no notes)"
+        preview  = body[:140].replace("\n", " ")
+        if len(body) > 140:
             preview += "..."
         print(f"    {i}. [{when}] {preview}")
     print_separator("-", 60)
 
 
 def print_scorecard():
-    log = load_call_log()
-    if not log:
-        print("\n  No calls logged yet.")
-        return
-
-    now = datetime.now()
-    week_start = now - timedelta(days=now.weekday())  # Monday
-    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    week_calls = [e for e in log if datetime.fromisoformat(e["timestamp"]) >= week_start]
-    today_calls = [e for e in log if datetime.fromisoformat(e["timestamp"]).date() == now.date()]
-    month_calls = [
-        e for e in log
-        if (dt := datetime.fromisoformat(e["timestamp"])).year == now.year and dt.month == now.month
-    ]
-    year_calls = [e for e in log if datetime.fromisoformat(e["timestamp"]).year == now.year]
-
-    day_total = len(today_calls)
-    week_total = len(week_calls)
-    month_total = len(month_calls)
-    year_total = len(year_calls)
-    all_time_total = len(log)
+    now         = datetime.now()
+    year_start  = datetime(now.year, 1, 1)
+    week_start  = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     print()
+    print("  Fetching call history from Keap...")
+    notes = get_all_call_notes_since(year_start)
+
+    def note_dt(n):
+        return _parse_keap_date(n.get("last_updated") or n.get("date_created", ""))
+
+    year_notes  = [n for n in notes if note_dt(n)]
+    month_notes = [n for n in year_notes if note_dt(n) >= month_start]
+    week_notes  = [n for n in year_notes if note_dt(n) >= week_start]
+    today_notes = [n for n in year_notes if note_dt(n) and note_dt(n).date() == now.date()]
+
     print_separator("=", 60)
-    print("  WEEKLY CALL SCORECARD")
+    print("  CALL SCORECARD")
     print_separator("=", 60)
     print(f"  Today      : {now.strftime('%A %b %d')}  |  Week start: {week_start.strftime('%A %b %d')}")
     print_separator("-", 60)
-    print(f"  Day total      : {day_total}")
-    print(f"  Weekly total   : {week_total}")
-    print(f"  Monthly total  : {month_total} ({now.strftime('%b %Y')})")
-    print(f"  Year total     : {year_total} ({now.year})")
-    print(f"  Total (all)    : {all_time_total}")
+    print(f"  Today          : {len(today_notes)}")
+    print(f"  This week      : {len(week_notes)}")
+    print(f"  This month     : {len(month_notes)} ({now.strftime('%b %Y')})")
+    print(f"  This year      : {len(year_notes)} ({now.year})")
     print_separator("-", 60)
-    print()
 
-    if week_calls:
-        print("  This week's calls:")
+    if week_notes:
+        print("\n  This week's calls:")
         print_separator("-", 60)
-        for e in sorted(week_calls, key=lambda x: x["timestamp"], reverse=True):
-            dt = datetime.fromisoformat(e["timestamp"])
-            print(f"  {dt.strftime('%a %b %d %I:%M %p')}  {e['contact_name']}")
-            if e.get("opportunity"):
-                print(f"    Opp: {e['opportunity']}")
-            if e.get("notes"):
-                preview = e["notes"][:80].replace("\n", " ")
-                if len(e["notes"]) > 80:
-                    preview += "..."
+        for n in sorted(week_notes, key=lambda x: note_dt(x) or datetime.min, reverse=True):
+            dt      = note_dt(n)
+            when    = dt.strftime("%a %b %d %I:%M %p") if dt else "?"
+            title   = n.get("title", "")
+            body    = (n.get("body") or "").strip()
+            preview = body[:80].replace("\n", " ")
+            if len(body) > 80:
+                preview += "..."
+            print(f"  {when}  {title}")
+            if preview:
                 print(f"    Notes: {preview}")
             print()
 
-    # Top contacts called
-    from collections import Counter
-    top = Counter(e["contact_name"] for e in log).most_common(5)
-    if top:
-        print("\n  Most called contacts:")
-        for name, count in top:
-            print(f"    {name}: {count} call(s)")
     print_separator("=", 60)
 
 
@@ -510,11 +413,10 @@ def print_scorecard():
 def run_call_session():
     print_separator("=", 60)
     print("  KEAP CALL MANAGER")
-    print("  Commands: next | skip | scorecard | quit")
+    print("  Commands: c (called) | s (skip) | sc (scorecard) | q (quit)")
     print_separator("=", 60)
     print()
 
-    # Verify connection
     try:
         _access_token()
         print("  Connected to Keap.\n")
@@ -522,9 +424,8 @@ def run_call_session():
         print(f"  ERROR: Cannot connect to Keap: {e}")
         sys.exit(1)
 
-    log = load_call_log()
     print("  Building call queue (fetching opportunities)...")
-    queue = build_call_queue(log)
+    queue = build_call_queue()
 
     if not queue:
         print("  No active opportunities found. Nothing to call.")
@@ -538,15 +439,13 @@ def run_call_session():
             print("  You have reached the end of the call queue.")
             ans = input("  Restart from top? (y/n): ").strip().lower()
             if ans == "y":
-                idx = 0
-                log = load_call_log()  # reload to re-score
-                queue = build_call_queue(log)
+                idx   = 0
+                queue = build_call_queue()
             else:
                 break
 
-        item = queue[idx]
+        item   = queue[idx]
         print_contact_card(item, idx + 1)
-
         print("  [c] Called   [s] Skip   [sc] Scorecard   [q] Quit")
         action = input("  > ").strip().lower()
 
@@ -555,7 +454,6 @@ def run_call_session():
 
         elif action in ("sc", "scorecard"):
             print_scorecard()
-            # Don't advance
             continue
 
         elif action in ("s", "skip", "next"):
@@ -565,7 +463,7 @@ def run_call_session():
 
         elif action in ("c", "called", ""):
             print()
-            print_prior_notes(item, log, limit=2)
+            print_prior_notes(item)
             print(f"  Notes for call with {item['name']}:")
             print("  (Enter your notes. Press Enter twice when done.)")
             lines = []
@@ -574,28 +472,14 @@ def run_call_session():
                 if line == "" and lines and lines[-1] == "":
                     break
                 lines.append(line)
-            notes = "\n".join(lines).strip()
+            notes = "\n".join(lines).strip() or "(no notes entered)"
 
-            if not notes:
-                notes = "(no notes entered)"
-
-            # Save to Keap
             print(f"\n  Saving note to Keap...", end=" ")
-            result = store_call_note_in_keap(item["contact_id"], notes)
-            if result:
-                print("saved.")
-            else:
-                print("failed (check warning above). Notes saved locally.")
+            result = store_call_note_in_keap(item["contact_id"], item["name"], notes)
+            print("saved." if result else "failed.")
 
-            # Save to local log
-            log_call(item["contact_id"], item["name"], item["opp_title"], notes)
             record_shown(item["contact_id"])
-            log = load_call_log()  # refresh
-
-            print(f"  Call logged for {item['name']}.")
-            print()
-
-            # Show next suggestion
+            print(f"  Call logged for {item['name']}.\n")
             idx += 1
 
         else:
