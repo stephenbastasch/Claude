@@ -1,0 +1,6 @@
+project_manager_credentials.json
+project_manager_token.json
+__pycache__/
+*.pyc
+call_log.json
+queue_state.json
